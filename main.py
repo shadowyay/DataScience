@@ -1,85 +1,94 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report
+import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
-import matplotlib.pyplot as plt  # Added for plotting
+from tensorflow.keras.layers import Dense
+import matplotlib.pyplot as plt
 
 # Load the dataset
-df = pd.read_csv("last1.csv")
+data = pd.read_csv('last1.csv')
 
-# Fix column names by stripping spaces
-df.columns = df.columns.str.strip()
+# Remove leading/trailing spaces from column names to avoid KeyError
+data.columns = data.columns.str.strip()
 
-# Create Date index
-df['Date'] = pd.to_datetime(df[['year', 'month', 'day']])
-df.set_index('Date', inplace=True)
+# Define the cleaning function for the 'Classes' column
+def clean_classes(x):
+    x = str(x).strip()  # Ensure x is a string and strip any extra spaces
+    if x == "not fire":
+        return 0
+    elif x == "fire":
+        return 1
+    else:
+        return np.nan  # Handle unexpected values (will be dropped later)
 
-# Encode target variable (binary: 1 for fire, 0 for not fire)
-df['Fire'] = df['Classes'].apply(lambda x: 1 if 'fire' in x.lower() else 0)
+# Apply the cleaning function to the 'Classes' column
+data['Classes'] = data['Classes'].apply(clean_classes)
 
-# Select features and target
-features = ['Temperature', 'RH', 'Ws', 'Rain', 'FFMC', 'DMC', 'DC', 'ISI', 'BUI', 'FWI']
-X = df[features]
-y = df['Fire']
+# Drop the "year" column (assumed to be a constant value)
+data = data.drop(columns=['year'])
 
-# Split into train and test (chronological split, ~80% train)
-train_size = int(len(df) * 0.8)
-train_X = X.iloc[:train_size]
-test_X = X.iloc[train_size:]
-train_y = y.iloc[:train_size]
-test_y = y.iloc[train_size:]
+# One-hot encode the "month" column
+data = pd.get_dummies(data, columns=['month'], prefix='month')
 
-# Scale features
-feature_scaler = MinMaxScaler()
-feature_scaler.fit(train_X)
-scaled_train_X = feature_scaler.transform(train_X)
-scaled_test_X = feature_scaler.transform(test_X)
+# Drop rows with missing values (e.g., from unexpected 'Classes' values)
+data = data.dropna()
 
-# Reshape target for consistency (though binary, we treat as float)
-train_y_np = train_y.values.reshape(-1, 1).astype(float)
-test_y_np = test_y.values.reshape(-1, 1).astype(float)
+# Split into features (X) and target (y)
+X = data.drop(columns=['Classes'])
+y = data['Classes']
 
-# We don't scale binary targets typically, but for consistency with original code
-target_scaler = MinMaxScaler()
-target_scaler.fit(train_y_np)
-scaled_train_y = target_scaler.transform(train_y_np)
-scaled_test_y = target_scaler.transform(test_y_np)
+# Split into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Parameters for time series generator
-batch = 1
-input_length = 12  # Using similar input length as original code
-features_count = len(features)
+# Scale the features
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
 
-# Generate time series sequences for training
-generator = TimeseriesGenerator(scaled_train_X, scaled_train_y, length=input_length, batch_size=batch)
+# Define the neural network model
+model = Sequential([
+    Dense(64, activation='relu', input_shape=(X_train.shape[1],)),
+    Dense(1, activation='sigmoid')
+])
 
-# Generate test sequences
-test_generator = TimeseriesGenerator(scaled_test_X, scaled_test_y, length=input_length, batch_size=batch)
-
-# Build the model
-model = Sequential()
-model.add(LSTM(100, activation='relu', input_shape=(input_length, features_count)))
-model.add(Dense(1, activation='sigmoid'))  # Sigmoid for binary classification
-
+# Compile the model
 model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
 # Train the model
-model.fit(generator, epochs=10)
+history = model.fit(X_train, y_train, epochs=10, batch_size=32, validation_split=0.2, verbose=1)
 
-# Predict on test sequences
-scaled_predictions = model.predict(test_generator)
+# Evaluate the model
+loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
+print(f'\nTest Accuracy: {accuracy:.4f}')
 
-# Inverse transform predictions and threshold for binary
-true_predictions = target_scaler.inverse_transform(scaled_predictions)
-binary_predictions = (true_predictions > 0.5).astype(int)
+# Predict and print detailed metrics
+y_pred = (model.predict(X_test) > 0.5).astype(int)
+print('\nClassification Report:')
+print(classification_report(y_test, y_pred, target_names=['Not Fire', 'Fire']))
 
-# Add predictions to test dataframe (aligning for sequence length)
-test_df = test_X.iloc[input_length:].copy()
-test_df['Actual'] = test_y.iloc[input_length:]
-test_df['Predictions'] = binary_predictions.flatten()  # Flatten to match shape
+# Plot training and validation metrics
+plt.figure(figsize=(12, 4))
 
-# Plot actual vs predictions
-test_df[['Actual', 'Predictions']].plot(figsize=(14, 5))
-plt.show()  # Explicitly show the plot
+# Plot loss
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+# Plot accuracy
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
