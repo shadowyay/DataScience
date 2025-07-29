@@ -1,140 +1,85 @@
-"""
-Fixed Forest Fire Prediction System
------------------------------------
-Improvements:
-- Classification (fire vs. no fire) instead of regression for better handling of skewed data.
-- Simpler LSTM with tuning.
-- Sequences from sorted data (by month/day) to approximate time-series.
-- Evaluation with classification metrics and graphs.
-
-Requirements: tensorflow, scikit-learn, matplotlib, pandas, numpy
-"""
-
-import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-from sklearn.model_selection import train_test_split
-import tensorflow as tf
-from tensorflow.keras import layers, models, callbacks #type: ignore
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+import matplotlib.pyplot as plt  # Added for plotting
 
-SEED = 42
-SEQ_LEN = 30
-TEST_RATIO = 0.20
-BATCH_SIZE = 16  # Smaller for better generalization
-EPOCHS = 100
-PATIENCE = 10
+# Load the dataset
+df = pd.read_csv("last1.csv")
 
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
+# Fix column names by stripping spaces
+df.columns = df.columns.str.strip()
 
-# Load data
-df = pd.read_csv("forestfires.csv")
+# Create Date index
+df['Date'] = pd.to_datetime(df[['year', 'month', 'day']])
+df.set_index('Date', inplace=True)
 
-# Preprocessing
-for col in ["month", "day"]:
-    le = LabelEncoder()
-    df[col] = le.fit_transform(df[col])
+# Encode target variable (binary: 1 for fire, 0 for not fire)
+df['Fire'] = df['Classes'].apply(lambda x: 1 if 'fire' in x.lower() else 0)
 
-# Sort by month and day to approximate time-series
-df = df.sort_values(by=['month', 'day']).reset_index(drop=True)
+# Select features and target
+features = ['Temperature', 'RH', 'Ws', 'Rain', 'FFMC', 'DMC', 'DC', 'ISI', 'BUI', 'FWI']
+X = df[features]
+y = df['Fire']
 
-# Binary target: 1 if area > 0 (fire), 0 otherwise
-df['fire'] = (df['area'] > 0).astype(int)
-feature_cols = df.columns.drop(['area', 'fire'])
-X_raw = df[feature_cols].values.astype(np.float32)
-y_raw = df['fire'].values.astype(np.float32)
+# Split into train and test (chronological split, ~80% train)
+train_size = int(len(df) * 0.8)
+train_X = X.iloc[:train_size]
+test_X = X.iloc[train_size:]
+train_y = y.iloc[:train_size]
+test_y = y.iloc[train_size:]
 
 # Scale features
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_raw)
+feature_scaler = MinMaxScaler()
+feature_scaler.fit(train_X)
+scaled_train_X = feature_scaler.transform(train_X)
+scaled_test_X = feature_scaler.transform(test_X)
 
-# Create sequences
-def make_windows(data, targets, seq_len):
-    X, y = [], []
-    for i in range(len(data) - seq_len):
-        X.append(data[i : i + seq_len])
-        y.append(targets[i + seq_len])
-    return np.asarray(X), np.asarray(y)
+# Reshape target for consistency (though binary, we treat as float)
+train_y_np = train_y.values.reshape(-1, 1).astype(float)
+test_y_np = test_y.values.reshape(-1, 1).astype(float)
 
-X_seq, y_seq = make_windows(X_scaled, y_raw, SEQ_LEN)
+# We don't scale binary targets typically, but for consistency with original code
+target_scaler = MinMaxScaler()
+target_scaler.fit(train_y_np)
+scaled_train_y = target_scaler.transform(train_y_np)
+scaled_test_y = target_scaler.transform(test_y_np)
 
-# Train/test split (chronological)
-split_idx = int((1 - TEST_RATIO) * len(X_seq))
-X_train, X_test = X_seq[:split_idx], X_seq[split_idx:]
-y_train, y_test = y_seq[:split_idx], y_seq[split_idx:]
+# Parameters for time series generator
+batch = 1
+input_length = 12  # Using similar input length as original code
+features_count = len(features)
 
-# Calculate class weights for imbalanced dataset
-neg, pos = np.bincount(y_train.astype(int))
-total = neg + pos
-print(f"\nTotal examples: {total}\nPositive examples: {pos} ({100 * pos / total:.2f}% of total)\n")
+# Generate time series sequences for training
+generator = TimeseriesGenerator(scaled_train_X, scaled_train_y, length=input_length, batch_size=batch)
 
-# Scaling by total to avoid very small loss value, then divide by number of examples of given class
-weight_for_0 = (1 / neg) * (total / 2.0)
-weight_for_1 = (1 / pos) * (total / 2.0)
+# Generate test sequences
+test_generator = TimeseriesGenerator(scaled_test_X, scaled_test_y, length=input_length, batch_size=batch)
 
-class_weight = {0: weight_for_0, 1: weight_for_1}
-print(f"Class weights: {class_weight}")
+# Build the model
+model = Sequential()
+model.add(LSTM(100, activation='relu', input_shape=(input_length, features_count)))
+model.add(Dense(1, activation='sigmoid'))  # Sigmoid for binary classification
 
-# Model: Simpler LSTM for classification
-model = models.Sequential([
-    layers.Input(shape=(SEQ_LEN, X_train.shape[-1])),
-    layers.LSTM(32, return_sequences=True),
-    layers.Dropout(0.3),
-    layers.LSTM(16),
-    layers.Dense(8, activation="relu"),
-    layers.Dropout(0.2),
-    layers.Dense(1, activation="sigmoid")  # Binary output
-])
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
-model.compile(
-    loss="binary_crossentropy",
-    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-    metrics=["accuracy"]
-)
+# Train the model
+model.fit(generator, epochs=10)
 
-# Train with early stopping
-cb_early = callbacks.EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True)
-history = model.fit(
-    X_train, y_train,
-    validation_split=0.1,
-    epochs=EPOCHS,
-    batch_size=BATCH_SIZE,
-    callbacks=[cb_early],
-    class_weight=class_weight, # Added class weight
-    verbose=2
-)
+# Predict on test sequences
+scaled_predictions = model.predict(test_generator)
 
-# Evaluate
-y_pred_prob = model.predict(X_test).squeeze()
-y_pred = (y_pred_prob > 0.5).astype(int)
-acc = accuracy_score(y_test, y_pred)
-prec = precision_score(y_test, y_pred)
-rec = recall_score(y_test, y_pred)
-f1 = f1_score(y_test, y_pred)
+# Inverse transform predictions and threshold for binary
+true_predictions = target_scaler.inverse_transform(scaled_predictions)
+binary_predictions = (true_predictions > 0.5).astype(int)
 
-print(f"\nTest Accuracy: {acc:.2f}")
-print(f"Precision: {prec:.2f}")
-print(f"Recall: {rec:.2f}")
-print(f"F1 Score: {f1:.2f}")
+# Add predictions to test dataframe (aligning for sequence length)
+test_df = test_X.iloc[input_length:].copy()
+test_df['Actual'] = test_y.iloc[input_length:]
+test_df['Predictions'] = binary_predictions.flatten()  # Flatten to match shape
 
-# Confusion matrix
-cm = confusion_matrix(y_test, y_pred)
-print("Confusion Matrix:\n", cm)
-
-# Plot predicted vs actual
-plt.figure(figsize=(10, 5))
-plt.plot(y_test, label="Actual Fire (1=Yes, 0=No)", marker='o')
-plt.plot(y_pred, label="Predicted", marker='x', linestyle='--')
-plt.xlabel("Test Samples")
-plt.ylabel("Fire Occurrence")
-plt.title("Predicted vs Actual Fire Occurrences")
-plt.legend()
-plt.show()
-
-# Future prediction (using last 30 records)
-latest_window = X_scaled[-SEQ_LEN:].reshape(1, SEQ_LEN, -1)
-forecast_prob = model.predict(latest_window)[0, 0]
-forecast = "HIGH RISK (Fire likely)" if forecast_prob > 0.5 else "LOW RISK (No fire expected)"
-print(f"\nFuture Prediction: {forecast} (Probability: {forecast_prob:.2f})")
+# Plot actual vs predictions
+test_df[['Actual', 'Predictions']].plot(figsize=(14, 5))
+plt.show()  # Explicitly show the plot
